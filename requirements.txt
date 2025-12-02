@@ -4,3 +4,4 @@ requests
 python-dotenv
 pillow
 matplotlib
+Flask==2.3.3
