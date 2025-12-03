@@ -1,186 +1,199 @@
-import discord
-from discord import app_commands
-from discord.ext import commands
+# pyright: reportMissingImports=false
+import os
+import threading
 import json
-import random
-import io
-import aiohttp
+from datetime import timezone
+from flask import Flask
 
-# ==========================
-# BOT初期設定
-# ==========================
-intents = discord.Intents.all()
+import discord
+from discord.ext import commands
+
+# ----------------------------
+# Flask (Render用)
+# ----------------------------
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "Bot is running!"
+
+def run_flask():
+    app.run(host="0.0.0.0", port=8080)
+
+# Flask を別スレッドで起動
+threading.Thread(target=run_flask).start()
+
+# ----------------------------
+# Discord BOT 準備
+# ----------------------------
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-DATA_FILE = "data.json"
+# ----------------------------
+# ファイルとデータ
+# ----------------------------
+DATA_FILE = "global_chat_data.json"
+ECON_FILE = "economy_data.json"
+SHOP_FILE = "shop_data.json"
 
-def load_data():
-    try:
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except:
-        return {"global_channels": {}, "economy": {}}
+def load_json(path, default):
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except:
+            return default
+    return default
 
-def save_data(data):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+def save_json(path, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
 
-app_data = load_data()
+data = load_json(DATA_FILE, {"global_channels": {}})
+economy_data = load_json(ECON_FILE, {"balances": {}, "daily_message_count": {}})
+shop_data = load_json(SHOP_FILE, {})
 
-# ==========================
-# グローバルチャット系
-# ==========================
-class GlobalChat(app_commands.Group):
-    def __init__(self):
-        super().__init__(name="global", description="グローバルチャット関連コマンド")
+# ----------------------------
+# グローバルチャット転送
+# ----------------------------
+async def broadcast_global_message(channel, author, content, attachments):
+    guild_id = str(channel.guild.id)
 
-    @app_commands.command(name="create", description="グローバルチャット作成")
-    async def global_create(self, interaction: discord.Interaction, name: str):
-        await interaction.response.defer(ephemeral=True)
-        if name in app_data["global_channels"]:
-            await interaction.followup.send("すでに存在しています", ephemeral=True)
-            return
-        app_data["global_channels"][name] = []
-        save_data(app_data)
-        await interaction.followup.send(f"グローバルチャット `{name}` を作成しました", ephemeral=True)
+    for room, ch_list in data["global_channels"].items():
+        for target in ch_list:
+            tgt_guild_id, tgt_ch_id = map(int, target.split(":"))
 
-    @app_commands.command(name="join", description="グローバルチャットに参加")
-    async def global_join(self, interaction: discord.Interaction, name: str):
-        await interaction.response.defer(ephemeral=True)
-        if name not in app_data["global_channels"]:
-            await interaction.followup.send("存在しないチャットです", ephemeral=True)
-            return
-        channel_id = str(interaction.channel.id)
-        if channel_id in app_data["global_channels"][name]:
-            await interaction.followup.send("すでに参加済みです", ephemeral=True)
-            return
-        app_data["global_channels"][name].append(channel_id)
-        save_data(app_data)
-        await interaction.followup.send(f"このチャンネルを `{name}` に参加させました", ephemeral=True)
+            # 同じチャンネルには送らない
+            if tgt_guild_id == channel.guild.id and tgt_ch_id == channel.id:
+                continue
 
-    @app_commands.command(name="leave", description="グローバルチャットから脱退")
-    async def global_leave(self, interaction: discord.Interaction, name: str):
-        await interaction.response.defer(ephemeral=True)
-        if name not in app_data["global_channels"]:
-            await interaction.followup.send("存在しないチャットです", ephemeral=True)
-            return
-        channel_id = str(interaction.channel.id)
-        if channel_id not in app_data["global_channels"][name]:
-            await interaction.followup.send("参加していません", ephemeral=True)
-            return
-        app_data["global_channels"][name].remove(channel_id)
-        save_data(app_data)
-        await interaction.followup.send(f"このチャンネルを `{name}` から脱退させました", ephemeral=True)
+            tgt_guild = bot.get_guild(tgt_guild_id)
+            if not tgt_guild:
+                continue
+            tgt_channel = tgt_guild.get_channel(tgt_ch_id)
+            if not tgt_channel:
+                continue
 
-bot.tree.add_command(GlobalChat())
+            # メッセージ送信
+            embed = discord.Embed(
+                description=content or "(添付のみ)",
+                color=discord.Color.blue()
+            )
+            embed.set_author(
+                name=f"{author.display_name} @ {channel.guild.name}",
+                icon_url=author.display_avatar.url
+            )
 
-# ==========================
-# メッセージ転送イベント
-# ==========================
+            await tgt_channel.send(embed=embed)
+
+            for a in attachments:
+                await tgt_channel.send(a.url)
+
+
+# ----------------------------
+# on_message
+# ----------------------------
 @bot.event
-async def on_message(message):
+async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    for chat_name, channels in app_data["global_channels"].items():
-        if str(message.channel.id) in channels:
-            for ch_id in channels:
-                if ch_id == str(message.channel.id):
-                    continue
-                try:
-                    target = bot.get_channel(int(ch_id))
-                    if target is None:
-                        continue
+    # グローバルチャット
+    await broadcast_global_message(message.channel, message.author, message.content, message.attachments)
 
-                    # メッセージ本文
-                    content = f"**{message.guild.name} / {message.channel.name}**\n{message.author.name}: {message.content}"
+    # 経済：3回に1コイン
+    user_id = str(message.author.id)
+    today = message.created_at.date().isoformat()
+    econ_counts = economy_data.setdefault("daily_message_count", {}).setdefault(user_id, {})
+    econ_counts[today] = econ_counts.get(today, 0) + 1
 
-                    # 添付ファイル
-                    files = []
-                    for attachment in message.attachments:
-                        fp = io.BytesIO()
-                        await attachment.save(fp)
-                        fp.seek(0)
-                        files.append(discord.File(fp, filename=attachment.filename))
+    # 3回に1回
+    if econ_counts[today] % 3 == 0:
+        balances = economy_data.setdefault("balances", {})
+        balances[user_id] = balances.get(user_id, 0) + 1
 
-                    await target.send(content, files=files)
-                except Exception as e:
-                    print(f"転送失敗: {e}")
+    save_json(ECON_FILE, economy_data)
 
-# ==========================
-# 経済系コマンド
-# ==========================
-class Economy(app_commands.Group):
-    def __init__(self):
-        super().__init__(name="eco", description="経済・お金関連")
+    await bot.process_commands(message)
 
-    def get_balance(self, user_id):
-        return app_data["economy"].get(str(user_id), 0)
+# ----------------------------
+# グローバルチャット管理
+# ----------------------------
+@bot.tree.command(name="global_create", description="グローバルチャット部屋を作成")
+async def global_create(interaction: discord.Interaction, name: str):
+    if name in data["global_channels"]:
+        await interaction.response.send_message("既に存在しています。", ephemeral=True)
+        return
 
-    def add_money(self, user_id, amount):
-        uid = str(user_id)
-        app_data["economy"][uid] = app_data["economy"].get(uid, 0) + amount
-        save_data(app_data)
+    data["global_channels"][name] = []
+    save_json(DATA_FILE, data)
 
-    @app_commands.command(name="balance", description="自分の残高を確認")
-    async def balance(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        bal = self.get_balance(interaction.user.id)
-        await interaction.followup.send(f"あなたの残高: {bal} 💰", ephemeral=True)
+    await interaction.response.send_message(f"グローバルチャット `{name}` を作成しました！", ephemeral=True)
 
-    @app_commands.command(name="give", description="他人にお金を送る")
-    async def give(self, interaction: discord.Interaction, member: discord.Member, amount: int):
-        await interaction.response.defer(ephemeral=True)
-        if amount <= 0:
-            await interaction.followup.send("送金額は正の数で入力してください", ephemeral=True)
-            return
-        if self.get_balance(interaction.user.id) < amount:
-            await interaction.followup.send("残高が不足しています", ephemeral=True)
-            return
-        self.add_money(interaction.user.id, -amount)
-        self.add_money(member.id, amount)
-        await interaction.followup.send(f"{member.name} に {amount} 💰 を送金しました", ephemeral=True)
+@bot.tree.command(name="global_join", description="このチャンネルをグローバルチャットに参加させる")
+async def global_join(interaction: discord.Interaction, name: str):
+    if name not in data["global_channels"]:
+        await interaction.response.send_message("そのグローバルチャットは存在しません。", ephemeral=True)
+        return
 
-bot.tree.add_command(Economy())
+    ch = interaction.channel
+    identifier = f"{ch.guild.id}:{ch.id}"
 
-# ==========================
-# 雑談系コマンド
-# ==========================
-class Chat(app_commands.Group):
-    def __init__(self):
-        super().__init__(name="chat", description="雑談・ミニBOT応答")
+    if identifier in data["global_channels"][name]:
+        await interaction.response.send_message("このチャンネルはすでに参加しています。", ephemeral=True)
+        return
 
-    @app_commands.command(name="hello", description="挨拶")
-    async def hello(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        await interaction.followup.send(f"こんにちは {interaction.user.name}！", ephemeral=True)
+    data["global_channels"][name].append(identifier)
+    save_json(DATA_FILE, data)
+    await interaction.response.send_message(f"このチャンネルを `{name}` に参加させました！", ephemeral=True)
 
-bot.tree.add_command(Chat())
+# ----------------------------
+# 経済
+# ----------------------------
+@bot.tree.command(name="balance", description="コイン残高を表示")
+async def balance(interaction: discord.Interaction):
+    user_id = str(interaction.user.id)
+    bal = economy_data.get("balances", {}).get(user_id, 0)
+    await interaction.response.send_message(f"💰 あなたのコイン：{bal}", ephemeral=True)
 
-# ==========================
-# ゲーム系コマンド
-# ==========================
-class Game(app_commands.Group):
-    def __init__(self):
-        super().__init__(name="game", description="簡単なミニゲーム")
+# ----------------------------
+# ロールショップ
+# ----------------------------
+@bot.tree.command(name="shop_add", description="ロールを商品として登録")
+async def shop_add(interaction: discord.Interaction, role: discord.Role, price: int):
+    shop_data[str(role.id)] = price
+    save_json(SHOP_FILE, shop_data)
+    await interaction.response.send_message(f"ロール `{role.name}` を {price} コインで登録しました。", ephemeral=True)
 
-    @app_commands.command(name="roll", description="サイコロを振る")
-    async def roll(self, interaction: discord.Interaction, sides: int = 6):
-        await interaction.response.defer(ephemeral=True)
-        if sides < 2:
-            await interaction.followup.send("サイコロの目は2以上にしてください", ephemeral=True)
-            return
-        result = random.randint(1, sides)
-        await interaction.followup.send(f"🎲 {sides}面サイコロを振りました → {result}", ephemeral=True)
+@bot.tree.command(name="shop_buy", description="ロールを購入")
+async def shop_buy(interaction: discord.Interaction, role: discord.Role):
+    user_id = str(interaction.user.id)
 
-bot.tree.add_command(Game())
+    if str(role.id) not in shop_data:
+        await interaction.response.send_message("そのロールはショップにありません。", ephemeral=True)
+        return
 
-# ==========================
-# 起動
-# ==========================
-@bot.event
-async def on_ready():
-    await bot.tree.sync()
-    print(f"Logged in as {bot.user} (完全グローバルBOT)")
+    price = shop_data[str(role.id)]
+    bal = economy_data.get("balances", {}).get(user_id, 0)
 
-bot.run("YOUR_TOKEN_HERE")
+    if bal < price:
+        await interaction.response.send_message("コインが足りません！", ephemeral=True)
+        return
+
+    # ロール付与
+    await interaction.user.add_roles(role)
+
+    economy_data["balances"][user_id] -= price
+    save_json(ECON_FILE, economy_data)
+
+    await interaction.response.send_message(f"ロール `{role.name}` を購入しました！", ephemeral=True)
+
+
+
+# ----------------------------
+# BOT起動
+# ----------------------------
+TOKEN = os.environ.get("DISCORD_TOKEN")
+bot.run(TOKEN)
