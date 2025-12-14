@@ -1,306 +1,359 @@
-# pyright: reportMissingImports=false
+import os, json, re, threading
+from datetime import datetime, timezone, timedelta
+
 import discord
-from discord.ext import commands
-from discord import app_commands, ui
+from discord.ext import commands, tasks
+from discord import app_commands
 from discord.ui import View, Button
-import json
-import os
-from datetime import datetime, timezone
+
 import aiohttp
 from flask import Flask, request
-import threading
 
-# =================== Flask ===================
+# ===============================
+# データディレクトリ
+# ===============================
+DATA_DIR = "data"
+os.makedirs(DATA_DIR, exist_ok=True)
+
+def load_json(name, default):
+    path = os.path.join(DATA_DIR, f"{name}.json")
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return default
+
+def save_json(name, data):
+    with open(os.path.join(DATA_DIR, f"{name}.json"), "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+auth_data   = load_json("auth", {})
+invite_cfg  = load_json("invite", {})
+global_data = load_json("global", {})
+economy     = load_json("economy", {"balances": {}})
+shop        = load_json("shop", {})
+
+# ===============================
+# Flask（OAuth Callback）
+# ===============================
 app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "Bot is running!"
+    return "Bot is running"
 
 @app.route("/callback")
 def callback():
     code = request.args.get("code")
-    return f"認証コードを受け取りました: {code}"
+    return f"認証コード取得：{code} を Discord の /verify に貼り付けてください"
 
 def run_flask():
-    app.run(host="0.0.0.0", port=8080)
+    app.run(host="0.0.0.0", port=5000)
 
-threading.Thread(target=run_flask, daemon=True).start()
+# ===============================
+# OAuth 設定
+# ===============================
+CLIENT_ID = "YOUR_CLIENT_ID"
+CLIENT_SECRET = "YOUR_CLIENT_SECRET"
+BOT_TOKEN = "YOUR_BOT_TOKEN"
+REDIRECT_URI = "http://127.0.0.1:5000/callback"
 
-# =================== データファイル ===================
-DATA_FILE = "global_chat_data.json"
-ECON_FILE = "economy_data.json"
-SHOP_FILE = "shop_data.json"
-STATS_FILE = "stats.json"
-AUTH_FILE = "auth_settings.json"
+OAUTH_URL = (
+    "https://discord.com/api/oauth2/authorize"
+    f"?client_id={CLIENT_ID}"
+    f"&redirect_uri={REDIRECT_URI}"
+    "&response_type=code"
+    "&scope=identify%20guilds"
+)
 
-def load_json(path, default=None):
-    if default is None:
-        default = {}
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except:
-            return default
-    return default
-
-def save_json(path, obj):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=4, ensure_ascii=False)
-
-data = load_json(DATA_FILE, {"global_channels": {}})
-economy_data = load_json(ECON_FILE, {"balances": {}, "daily_message_count": {}})
-shop_data = load_json(SHOP_FILE, {})
-stats_data = load_json(STATS_FILE, {})
-auth_data = load_json(AUTH_FILE, {})
-
-# =================== Bot ===================
+# ===============================
+# Bot
+# ===============================
 intents = discord.Intents.default()
-intents.message_content = True
-intents.guilds = True
 intents.members = True
+intents.message_content = True
+
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# =================== グローバルチャット ===================
-async def broadcast_global_message(channel, author, content, attachments):
-    for ch_list in data.get("global_channels", {}).values():
-        for tgt in ch_list:
-            tgt_guild_id, tgt_ch_id = map(int, tgt.split(":"))
-            if tgt_guild_id == channel.guild.id and tgt_ch_id == channel.id:
-                continue
-            tgt_guild = bot.get_guild(tgt_guild_id)
-            tgt_channel = tgt_guild.get_channel(tgt_ch_id) if tgt_guild else None
-            if tgt_channel:
-                embed = discord.Embed(description=content or "(添付のみ)", color=discord.Color.blue())
-                embed.set_author(name=f"{author.display_name}@{channel.guild.name}", icon_url=author.display_avatar.url)
-                await tgt_channel.send(embed=embed)
-                for a in attachments:
-                    await tgt_channel.send(a.url)
+# ===============================
+# 定期保存タスク
+# ===============================
+@tasks.loop(minutes=5)
+async def save_task():
+    save_json("auth", auth_data)
+    save_json("invite", invite_cfg)
+    save_json("global", global_data)
+    save_json("economy", economy)
+    save_json("shop", shop)
+
+save_task.start()
+
+# ===============================
+# 招待リンク＆URL監視＋無視チャンネル対応
+# ===============================
+INVITE_REGEX = r"(discord\.gg|discord\.com\/invite)\/\S+"
+URL_REGEX = r"https?://[^\s]+"
 
 @bot.event
 async def on_message(message: discord.Message):
-    if message.author.bot:
+    if message.author.bot or not message.guild:
         return
 
-    guild_id_str = str(message.guild.id) if message.guild else None
-    today_str = message.created_at.astimezone(timezone.utc).date().isoformat()
+    gid = str(message.guild.id)
+    cfg = invite_cfg.setdefault(gid, {"enabled": False, "ignore": [], "url_watch": False})
 
-    # --- 統計 ---
-    if message.guild:
-        stats_data.setdefault("daily_messages", {})
-        guild_daily = stats_data["daily_messages"].setdefault(guild_id_str, {})
-        guild_daily[today_str] = guild_daily.get(today_str, 0) + 1
-        stats_data["daily_messages"][guild_id_str] = guild_daily
-        save_json(STATS_FILE, stats_data)
+    # 無視チャンネル判定
+    if message.channel.id not in cfg.get("ignore", []):
+        # 招待リンク
+        if cfg.get("enabled") and re.search(INVITE_REGEX, message.content):
+            await message.delete()
+            until = datetime.now(timezone.utc) + timedelta(minutes=10)
+            await message.author.timeout(until, reason="招待リンク送信")
+        # URL監視
+        elif cfg.get("url_watch") and re.search(URL_REGEX, message.content):
+            await message.delete()
+            await message.author.send(f"{message.channel.mention} で URL が禁止されています。")
 
-    # --- 経済 ---
-    if message.guild:
-        economy_data.setdefault("daily_message_count", {})
-        user_counts = economy_data["daily_message_count"].setdefault(str(message.author.id), {})
-        count_today = user_counts.get(today_str, 0) + 1
-        user_counts[today_str] = count_today
-        if count_today % 3 == 0:
-            economy_data.setdefault("balances", {})
-            economy_data["balances"][str(message.author.id)] = economy_data["balances"].get(str(message.author.id), 0) + 1
-        save_json(ECON_FILE, economy_data)
-
-    # --- グローバルチャット送信 ---
-    if message.guild:
-        for ch_list in data.get("global_channels", {}).values():
-            identifier = f"{guild_id_str}:{message.channel.id}"
-            if identifier in ch_list:
-                await broadcast_global_message(message.channel, message.author, message.content, message.attachments)
+    # グローバルチャット
+    identifier = f"{gid}:{message.channel.id}"
+    for name, chans in global_data.items():
+        if identifier in chans:
+            for tgt in chans:
+                if tgt == identifier:
+                    continue
+                tg, tc = map(int, tgt.split(":"))
+                g = bot.get_guild(tg)
+                if not g:
+                    continue
+                ch = g.get_channel(tc)
+                if ch:
+                    await ch.send(
+                        f"**{message.author.display_name}@{message.guild.name}**\n{message.content}"
+                    )
 
     await bot.process_commands(message)
 
-# =================== グローバルチャットコマンド ===================
-@bot.tree.command(name="global_create", description="グローバルチャット作成")
-async def global_create(interaction: discord.Interaction, name: str):
-    if name in data["global_channels"]:
-        await interaction.response.send_message("既に存在します", ephemeral=True)
-        return
-    data["global_channels"][name] = []
-    save_json(DATA_FILE, data)
-    await interaction.response.send_message(f"グローバルチャット `{name}` 作成", ephemeral=True)
+# ===============================
+# 招待リンク/URL監視 ON/OFF
+# ===============================
+@bot.tree.command(name="invite_watch")
+@discord.app_commands.checks.has_permissions(administrator=True)
+async def invite_watch(interaction: discord.Interaction, enabled: bool):
+    cfg = invite_cfg.setdefault(str(interaction.guild.id), {"enabled": False, "ignore": [], "url_watch": False})
+    cfg["enabled"] = enabled
+    save_json("invite", invite_cfg)
+    await interaction.response.send_message(f"招待リンク監視を {'有効' if enabled else '無効'} にしました", ephemeral=True)
 
-@bot.tree.command(name="global_join", description="このチャンネルをグローバルチャットに参加公式はhunya")
-async def global_join(interaction: discord.Interaction, name: str):
-    ch = interaction.channel
-    guild_id_str = str(ch.guild.id)
-    if name not in data["global_channels"]:
-        await interaction.response.send_message("存在しないグローバルチャットです", ephemeral=True)
-        return
-    identifier = f"{guild_id_str}:{ch.id}"
-    if identifier in data["global_channels"][name]:
-        await interaction.response.send_message("既に参加済みです", ephemeral=True)
-        return
-    data["global_channels"][name].append(identifier)
-    save_json(DATA_FILE, data)
-    await interaction.response.send_message(f"このチャンネルを `{name}` に参加させました", ephemeral=True)
+@bot.tree.command(name="url_watch")
+@discord.app_commands.checks.has_permissions(administrator=True)
+async def url_watch(interaction: discord.Interaction, enabled: bool):
+    cfg = invite_cfg.setdefault(str(interaction.guild.id), {"enabled": False, "ignore": [], "url_watch": False})
+    cfg["url_watch"] = enabled
+    save_json("invite", invite_cfg)
+    await interaction.response.send_message(f"URL監視を {'有効' if enabled else '無効'} にしました", ephemeral=True)
 
-# =================== 経済・ショップコマンド ===================
-@bot.tree.command(name="balance", description="自分のコイン残高を確認")
-async def balance(interaction: discord.Interaction):
-    user_id = str(interaction.user.id)
-    bal = economy_data.get("balances", {}).get(user_id, 0)
-    await interaction.response.send_message(f" あなたのコイン: {bal}", ephemeral=True)
+# ===============================
+# 無視チャンネル追加/削除
+# ===============================
+@bot.tree.command(name="invite_ignore_add")
+@discord.app_commands.checks.has_permissions(administrator=True)
+async def invite_ignore_add(interaction: discord.Interaction, channel: discord.TextChannel):
+    cfg = invite_cfg.setdefault(str(interaction.guild.id), {"enabled": False, "ignore": [], "url_watch": False})
+    if channel.id not in cfg["ignore"]:
+        cfg["ignore"].append(channel.id)
+    save_json("invite", invite_cfg)
+    await interaction.response.send_message(f"{channel.mention} を監視対象から除外しました", ephemeral=True)
 
-@bot.tree.command(name="shop_add", description="ロール商品を登録")
-@app_commands.describe(role="登録したいロール", price="値段（コイン）")
-async def shop_add(interaction: discord.Interaction, role: discord.Role, price: int):
-    shop_data[str(role.id)] = price
-    save_json(SHOP_FILE, shop_data)
-    await interaction.response.send_message(f"{role.name} を {price} コインで登録しました！")
+@bot.tree.command(name="invite_ignore_remove")
+@discord.app_commands.checks.has_permissions(administrator=True)
+async def invite_ignore_remove(interaction: discord.Interaction, channel: discord.TextChannel):
+    cfg = invite_cfg.setdefault(str(interaction.guild.id), {"enabled": False, "ignore": [], "url_watch": False})
+    if channel.id in cfg["ignore"]:
+        cfg["ignore"].remove(channel.id)
+    save_json("invite", invite_cfg)
+    await interaction.response.send_message(f"{channel.mention} を監視対象に戻しました", ephemeral=True)
 
-@bot.tree.command(name="shop_buy", description="ロールをコインで購入")
-async def shop_buy(interaction: discord.Interaction, role: discord.Role):
-    user_id = str(interaction.user.id)
-    price = shop_data.get(str(role.id))
-    if price is None:
-        await interaction.response.send_message("このロールはショップにありません", ephemeral=True)
-        return
-    bal = economy_data.get("balances", {}).get(user_id, 0)
-    if bal < price:
-        await interaction.response.send_message("コインが足りません", ephemeral=True)
-        return
-    try:
-        await interaction.user.add_roles(role)
-        economy_data["balances"][user_id] -= price
-        save_json(ECON_FILE, economy_data)
-        await interaction.response.send_message(f"ロール `{role.name}` を購入しました", ephemeral=True)
-    except discord.Forbidden:
-        await interaction.response.send_message("権限不足でロールを付与できません", ephemeral=True)
-
-@bot.tree.command(name="coin_ranking", description="コインのランキングを表示します")
-async def coin_ranking(interaction: discord.Interaction):
-    balances = economy_data.get("balances", {})
-    if not balances:
-        await interaction.response.send_message("まだコインを持っている人がいません。")
-        return
-    top_users = sorted(balances.items(), key=lambda x: x[1], reverse=True)[:10]
-    ranking_text = ""
-    for i, (user_id, coins) in enumerate(top_users, start=1):
-        user = interaction.guild.get_member(int(user_id)) if interaction.guild else None
-        username = user.display_name if user else f"User({user_id})"
-        ranking_text += f"{i}位: {username} — {coins}コイン\n"
-    await interaction.response.send_message(f" コインランキング \n{ranking_text}")
-
-# =================== DM ===================
-@bot.tree.command(name="dm", description="指定したユーザーIDにDMを送ります")
-@app_commands.describe(user_id="DMを送りたい相手のユーザーID", message="DMの内容")
-async def dm(interaction: discord.Interaction, user_id: str, message: str):
-    try:
-        uid = int(user_id)
-    except:
-        return await interaction.response.send_message("❌ ユーザーIDは数字で入力してね", ephemeral=True)
-    user = bot.get_user(uid)
-    if not user:
-        try:
-            user = await bot.fetch_user(uid)
-        except:
-            return await interaction.response.send_message("❌ ユーザーが見つかりませんでした", ephemeral=True)
-    try:
-        await user.send(message)
-        await interaction.response.send_message(f"📩 {user} にDMを送りました", ephemeral=True)
-    except discord.Forbidden:
-        await interaction.response.send_message("❌ DMを送れません（相手が閉じてる可能性）", ephemeral=True)
-
-# =================== 認証関連 ===================
-CLIENT_ID = "1445209748176896091"
-CLIENT_SECRET = "v0ScTzJKCBuWcTKsPmL_f5Aafvnme4P_"
-REDIRECT_URI = "https://e6f8eb51-bf0a-40d9-87ed-62f9c864e975-00-2rgefl7y9iyw7.riker.replit.dev:8080/callback"
-OAUTH_URL = f"https://discord.com/api/oauth2/authorize?client_id={CLIENT_ID}&redirect_uri={REDIRECT_URI}&response_type=code&scope=identify%20guilds"
-BANNED_GUILDS = [
-    1193327216642244778, 1313417956473966662, 1426163084468289589,
-    1403496250715803790, 1054832544845135934, 123617928892551299,
-    1430524783237529603, 1420924251824848988, 1418360870878318752,
-    1422851492452372582, 1433015067086964617, 1417875141169512498
-]
-
-@bot.tree.command(name="set_auth_role", description="認証後に付与するロールを設定（管理者専用）")
-@app_commands.checks.has_permissions(administrator=True)
-async def set_auth_role(interaction: discord.Interaction, role: discord.Role):
-    gid = str(interaction.guild.id)
-    auth_data[gid] = {"auth_role": role.id}
-    save_json(AUTH_FILE, auth_data)
-    await interaction.response.send_message(f"認証ロールを `{role.name}` に設定しました！", ephemeral=True)
-
-@bot.tree.command(name="auth", description="アカウント認証を開始します")
+# ===============================
+# 認証コマンド
+# ===============================
+@bot.tree.command(name="auth")
 async def auth(interaction: discord.Interaction):
-    class AuthButton(View):
-        def __init__(self):
-            super().__init__(timeout=None)
+    class V(View):
+        @Button(label="認証する", style=discord.ButtonStyle.blurple)
+        async def b(self, i: discord.Interaction, _):
+            await i.response.send_message(OAUTH_URL, ephemeral=True)
+    await interaction.response.send_message("ボタンを押して認証", view=V(), ephemeral=True)
 
-        @ui.button(label="認証を開始する", style=discord.ButtonStyle.blurple)
-        async def start_auth(self, i: discord.Interaction, b: Button):
-            await i.response.send_message(f"👇 こちらのリンクから認証してください！\n{OAUTH_URL}", ephemeral=True)
-
-    await interaction.response.send_message("アカウント認証を開始します。以下のボタンを押してください。", view=AuthButton(), ephemeral=True)
-
-@bot.tree.command(name="verify", description="認証済みか確認しロールを付与します")
+@bot.tree.command(name="verify")
 async def verify(interaction: discord.Interaction, code: str):
-    token_url = "https://discord.com/api/oauth2/token"
-    data_post = {"client_id": CLIENT_ID, "client_secret": CLIENT_SECRET, "grant_type":"authorization_code", "code": code, "redirect_uri": REDIRECT_URI}
+    await interaction.response.defer(ephemeral=True)
     async with aiohttp.ClientSession() as session:
-        async with session.post(token_url, data=data_post) as resp:
+        async with session.post(
+            "https://discord.com/api/oauth2/token",
+            data={
+                "client_id": CLIENT_ID,
+                "client_secret": CLIENT_SECRET,
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": REDIRECT_URI,
+            }
+        ) as resp:
             token_data = await resp.json()
+
     if "access_token" not in token_data:
-        return await interaction.response.send_message("認証に失敗しました。", ephemeral=True)
-    access_token = token_data["access_token"]
-    headers = {"Authorization": f"Bearer {access_token}"}
-    async with aiohttp.ClientSession() as session:
-        async with session.get("https://discord.com/api/users/@me/guilds", headers=headers) as resp:
-            guilds_info = await resp.json()
-    for g in guilds_info:
-        if int(g["id"]) in BANNED_GUILDS:
-            await interaction.guild.ban(interaction.user, reason="禁止サーバーに参加していたため")
-            return await interaction.response.send_message("❌ 認証失敗：禁止サーバーに参加しています。", ephemeral=True)
-    gid = str(interaction.guild.id)
-    if gid not in auth_data or "auth_role" not in auth_data[gid]:
-        return await interaction.response.send_message("認証ロールが設定されていません。", ephemeral=True)
-    role = interaction.guild.get_role(auth_data[gid]["auth_role"])
-    if not role:
-        return await interaction.response.send_message("設定された認証ロールが見つかりません。", ephemeral=True)
-    try:
-        await interaction.user.add_roles(role, reason="認証完了")
-    except discord.Forbidden:
-        return await interaction.response.send_message("ロールを付与できません（権限不足）。", ephemeral=True)
-    await interaction.response.send_message("✅ 認証完了しました！", ephemeral=True)
-    print("認証しました")
-from discord import Embed
-from datetime import datetime
+        await interaction.followup.send("認証失敗")
+        return
 
-@bot.tree.command(name="help", description="helpを表示します")
-async def help(interaction: discord.Interaction):
-    embed = Embed(
-        title="help",
-        description=(
-            "auth 認証を開始します\n"
-            "verify 認証コードで認証を完了します\n"
-            "set_auth_role 認証後に付与するロールを設定します\n"
-            "dm ユーザー ID で指定した相手に DM を送信します\n"
-            "balance メッセージ送信でたまるコインの残高を確認します\n"
-            "shop_add コインで買えるロールを設定します\n"
-            "shop_buy コインで買えるロールを買います\n"
-            "global_create サーバー間でチャットできるグローバルチャットを作成します\n"
-            "global_join 指定した名前のグローバルチャットに参加します\n"
-            "公式のグローバルチャットは `hunya` です"
-        ),
-        color=discord.Color.green(),
-        timestamp=datetime.utcnow()
+    role_id = auth_data.get(str(interaction.guild.id))
+    role = interaction.guild.get_role(role_id) if role_id else None
+    if role:
+        await interaction.user.add_roles(role)
+        await interaction.followup.send("認証完了！ロール付与しました")
+    else:
+        await interaction.followup.send("認証ロール未設定")
+
+@bot.tree.command(name="set_auth_role")
+@discord.app_commands.checks.has_permissions(administrator=True)
+async def set_auth_role(interaction: discord.Interaction, role: discord.Role):
+    auth_data[str(interaction.guild.id)] = role.id
+    save_json("auth", auth_data)
+    await interaction.response.send_message("認証ロール設定完了", ephemeral=True)
+
+# ===============================
+# チケット作成（ボタン式 + 自動削除ボタン）
+# ===============================
+class TicketView(View):
+    @Button(label="🎫 チケット作成", style=discord.ButtonStyle.green)
+    async def open(self, i: discord.Interaction, _):
+        cat = discord.utils.get(i.guild.categories, name="Tickets")
+        if not cat:
+            cat = await i.guild.create_category("Tickets")
+        ch = await i.guild.create_text_channel(
+            f"ticket-{i.user.name}",
+            category=cat,
+            overwrites={
+                i.guild.default_role: discord.PermissionOverwrite(read_messages=False),
+                i.user: discord.PermissionOverwrite(read_messages=True)
+            }
+        )
+        # チャンネル内に削除ボタンを送信
+        class CloseView(View):
+            @Button(label="❌ チケットを閉じる", style=discord.ButtonStyle.red)
+            async def close(self, inter: discord.Interaction, _):
+                await inter.response.send_message("チケットを削除します…", ephemeral=True)
+                await ch.delete()
+        await ch.send(f"{i.user.mention} のチケットです", view=CloseView())
+        await i.response.send_message(f"{ch.mention} を作成しました", ephemeral=True)
+
+@bot.tree.command(name="ticket_panel")
+async def ticket_panel(interaction: discord.Interaction):
+    await interaction.response.send_message("チケット作成", view=TicketView())
+
+# ===============================
+# ロールパネル（最大5）
+# ===============================
+class RolePanel(View):
+    def __init__(self, roles):
+        super().__init__(timeout=None)
+        for r in roles:
+            b = Button(label=r.name)
+            async def cb(i, role=r):
+                if role in i.user.roles:
+                    await i.user.remove_roles(role)
+                else:
+                    await i.user.add_roles(role)
+                await i.response.send_message("変更完了", ephemeral=True)
+            b.callback = cb
+            self.add_item(b)
+
+@bot.tree.command(name="role_panel")
+async def role_panel(
+    interaction: discord.Interaction,
+    r1: discord.Role,
+    r2: discord.Role = None,
+    r3: discord.Role = None,
+    r4: discord.Role = None,
+    r5: discord.Role = None
+):
+    roles = [r for r in [r1,r2,r3,r4,r5] if r]
+    await interaction.response.send_message("ロールパネル", view=RolePanel(roles))
+
+# ===============================
+# グローバルチャット
+# ===============================
+@bot.tree.command(name="global_create")
+async def global_create(interaction: discord.Interaction, name: str):
+    global_data[name] = []
+    save_json("global", global_data)
+    await interaction.response.send_message("作成完了", ephemeral=True)
+
+@bot.tree.command(name="global_join")
+async def global_join(interaction: discord.Interaction, name: str):
+    identifier = f"{interaction.guild.id}:{interaction.channel.id}"
+    global_data.setdefault(name, []).append(identifier)
+    save_json("global", global_data)
+    await interaction.response.send_message("参加完了", ephemeral=True)
+# ===============================
+# ヘルプコマンド（Embed版）
+# ===============================
+@bot.tree.command(name="help")
+async def help_command(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="中級Bot コマンド一覧",
+        description="以下のコマンドを使用できます",
+        color=discord.Color.blue()
     )
-    await interaction.response.send_message(embed=embed)
-# =================== on_ready ===================
-@bot.event
-async def on_ready():
-    print(f"Logged in as {bot.user}")
-    try:
-        synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} commands")
-    except Exception as e:
-        print(e)
 
-# =================== Bot 起動 ===================
-TOKEN = os.environ.get("DISCORD_TOKEN")
-bot.run(TOKEN)
+    # 認証
+    embed.add_field(
+        name="認証",
+        value="""
+/auth - 認証ボタンを表示
+/verify <code> - 認証コードでロール付与
+/set_auth_role <role> - 認証ロール設定
+""",
+        inline=False
+    )
+
+    # 招待リンク・URL監視
+    embed.add_field(
+        name="招待リンク・URL監視",
+        value="""
+/invite_watch <true/false> - 招待リンク監視ON/OFF
+/url_watch <true/false> - URL監視ON/OFF
+/invite_ignore_add <channel> - 無視チャンネル追加
+/invite_ignore_remove <channel> - 無視チャンネル削除
+""",
+        inline=False
+    )
+
+    # チケット
+    embed.add_field(
+        name="チケット",
+        value="/ticket_panel - チケット作成ボタン表示",
+        inline=False
+    )
+
+    # ロールパネル
+    embed.add_field(
+        name="ロールパネル",
+        value="/role_panel <r1> [r2 r3 r4 r5] - 最大5ロールのロールパネル作成",
+        inline=False
+    )
+
+    # グローバルチャット
+    embed.add_field(
+        name="グローバルチャット",
+        value="""
+/global_create <name> - グローバルチャット作成
+/global_join <name> - グローバルチャットに参加
+""",
+        inline=False
+    )
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+# ===============================
+# 起動
+# ===============================
+if __name__ == "__main__":
+    threading.Thread(target=run_flask, daemon=True).start()
+    bot.run(BOT_TOKEN)
