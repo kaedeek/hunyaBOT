@@ -3,12 +3,16 @@ import os
 import aiohttp
 import discord
 from discord.ext import commands
-from discord.ui import View, Button
+from discord.ui import View
 from flask import request
 
 from bot.config import CLIENT_ID, CLIENT_SECRET, REDIRECT_URI
 
+# ===============================
+# データ保存
+# ===============================
 DATA_DIR = "data"
+os.makedirs(DATA_DIR, exist_ok=True)
 
 def load(name, default):
     path = os.path.join(DATA_DIR, f"{name}.json")
@@ -22,7 +26,11 @@ def save(name, data):
         json.dump(data, f, indent=2, ensure_ascii=False)
 
 auth_data = load("auth", {})
+banned_guilds = load("banned_guilds", [])
 
+# ===============================
+# OAuth URL
+# ===============================
 OAUTH_URL = (
     "https://discord.com/api/oauth2/authorize"
     f"?client_id={CLIENT_ID}"
@@ -31,6 +39,9 @@ OAUTH_URL = (
     "&scope=identify%20guilds"
 )
 
+# ===============================
+# Cog
+# ===============================
 class AuthCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -38,7 +49,7 @@ class AuthCog(commands.Cog):
     # ===============================
     # /auth 認証ボタン
     # ===============================
-    @discord.app_commands.command(name="auth")
+    @discord.app_commands.command(name="auth", description="認証を開始します")
     async def auth(self, interaction: discord.Interaction):
 
         class AuthView(View):
@@ -52,7 +63,6 @@ class AuthCog(commands.Cog):
                     )
                 )
 
-
         await interaction.response.send_message(
             "ボタンを押して認証してください",
             view=AuthView(),
@@ -62,10 +72,11 @@ class AuthCog(commands.Cog):
     # ===============================
     # /verify 認証コード処理
     # ===============================
-    @discord.app_commands.command(name="verify")
+    @discord.app_commands.command(name="verify", description="認証コードを入力します")
     async def verify(self, interaction: discord.Interaction, code: str):
         await interaction.response.defer(ephemeral=True)
 
+        # トークン取得
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 "https://discord.com/api/oauth2/token",
@@ -83,6 +94,35 @@ class AuthCog(commands.Cog):
             await interaction.followup.send("❌ 認証に失敗しました")
             return
 
+        access_token = token_data["access_token"]
+
+        # ユーザーが参加しているサーバー取得
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://discord.com/api/users/@me/guilds",
+                headers={"Authorization": f"Bearer {access_token}"}
+            ) as resp:
+                user_guilds = await resp.json()
+
+        user_guild_ids = {g["id"] for g in user_guilds}
+
+        # 禁止サーバーチェック
+        for banned in banned_guilds:
+            if banned in user_guild_ids:
+                try:
+                    await interaction.guild.kick(
+                        interaction.user,
+                        reason="禁止サーバーに参加しています"
+                    )
+                except:
+                    pass
+
+                await interaction.followup.send(
+                    "❌ 禁止されているサーバーに参加しているため認証できません"
+                )
+                return
+
+        # ロール付与
         guild_id = str(interaction.guild.id)
         role_id = auth_data.get(guild_id)
         role = interaction.guild.get_role(role_id) if role_id else None
@@ -94,15 +134,11 @@ class AuthCog(commands.Cog):
             await interaction.followup.send("⚠️ 認証ロールが設定されていません")
 
     # ===============================
-    # /set_auth_role 管理者用
+    # /set_auth_role
     # ===============================
-    @discord.app_commands.command(name="set_auth_role")
+    @discord.app_commands.command(name="set_auth_role", description="認証ロールを設定")
     @discord.app_commands.checks.has_permissions(administrator=True)
-    async def set_auth_role(
-        self,
-        interaction: discord.Interaction,
-        role: discord.Role
-    ):
+    async def set_auth_role(self, interaction: discord.Interaction, role: discord.Role):
         auth_data[str(interaction.guild.id)] = role.id
         save("auth", auth_data)
         await interaction.response.send_message(
@@ -110,5 +146,51 @@ class AuthCog(commands.Cog):
             ephemeral=True
         )
 
+    # ===============================
+    # 禁止サーバー管理
+    # ===============================
+    @discord.app_commands.command(name="ban_server_add", description="禁止サーバーを追加")
+    @discord.app_commands.checks.has_permissions(administrator=True)
+    async def ban_server_add(self, interaction: discord.Interaction, guild_id: str):
+        if guild_id not in banned_guilds:
+            banned_guilds.append(guild_id)
+            save("banned_guilds", banned_guilds)
+
+        await interaction.response.send_message(
+            f"✅ サーバーID `{guild_id}` を禁止リストに追加しました",
+            ephemeral=True
+        )
+
+    @discord.app_commands.command(name="ban_server_remove", description="禁止サーバーを削除")
+    @discord.app_commands.checks.has_permissions(administrator=True)
+    async def ban_server_remove(self, interaction: discord.Interaction, guild_id: str):
+        if guild_id in banned_guilds:
+            banned_guilds.remove(guild_id)
+            save("banned_guilds", banned_guilds)
+
+        await interaction.response.send_message(
+            f"✅ サーバーID `{guild_id}` を禁止リストから削除しました",
+            ephemeral=True
+        )
+
+    @discord.app_commands.command(name="ban_server_list", description="禁止サーバー一覧")
+    @discord.app_commands.checks.has_permissions(administrator=True)
+    async def ban_server_list(self, interaction: discord.Interaction):
+        if not banned_guilds:
+            await interaction.response.send_message(
+                "禁止サーバーは設定されていません",
+                ephemeral=True
+            )
+            return
+
+        text = "\n".join(banned_guilds)
+        await interaction.response.send_message(
+            f"🚫 禁止サーバー一覧:\n{text}",
+            ephemeral=True
+        )
+
+# ===============================
+# setup
+# ===============================
 async def setup(bot):
     await bot.add_cog(AuthCog(bot))
