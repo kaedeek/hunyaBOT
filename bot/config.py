@@ -2,7 +2,9 @@ import os
 from os.path import join, dirname
 from dotenv import load_dotenv
 
-load_dotenv(join(dirname(__file__), '../.env'), verbose=True)
+import sys
+
+load_dotenv(join(dirname(__file__), f'../{'' if len(sys.argv) == 1 else sys.argv[1]}.env'), verbose=True)
 
 # ===== Discord =====
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
