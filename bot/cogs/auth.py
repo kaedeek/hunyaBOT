@@ -30,15 +30,15 @@ auth_codes    = load("auth_codes", {})
 # Cog
 # ===============================
 class AuthCog(commands.Cog):
-    def __init__(self, bot, public_url):
+    def __init__(self, bot, redirect_base_url):
         self.bot = bot
-        self.public_url = public_url
+        self.redirect_base_url = redirect_base_url
         self.bot.session = aiohttp.ClientSession()
         self.auth_loop.start()
 
     def make_oauth_url(self, user_id):
         from bot.config import CLIENT_ID
-        redirect_uri = f"{self.public_url}/callback"
+        redirect_uri = f"{self.redirect_base_url}/callback"
         return (
             "https://discord.com/api/oauth2/authorize"
             f"?client_id={CLIENT_ID}"
@@ -47,10 +47,6 @@ class AuthCog(commands.Cog):
             "&scope=identify%20guilds"
             f"&state={user_id}"
         )
-
-    @commands.Cog.listener()
-    async def on_ready(self):
-        print("AuthCog is ready")
 
     @commands.hybrid_command(name="auth", description="認証を開始します")
     async def auth(self, ctx):
@@ -77,7 +73,7 @@ class AuthCog(commands.Cog):
                     "client_secret": CLIENT_SECRET,
                     "grant_type": "authorization_code",
                     "code": code,
-                    "redirect_uri": f"{self.public_url}/callback",
+                    "redirect_uri": f"{self.redirect_base_url}/callback",
                 }
             ) as resp:
                 token = await resp.json()
@@ -89,7 +85,6 @@ class AuthCog(commands.Cog):
 
             access_token = token["access_token"]
 
-            # guilds取得
             async with self.bot.session.get(
                 "https://discord.com/api/users/@me/guilds",
                 headers={"Authorization": f"Bearer {access_token}"}
@@ -107,7 +102,6 @@ class AuthCog(commands.Cog):
                 save("auth_codes", auth_codes)
                 continue
 
-            # ロール付与
             for guild in self.bot.guilds:
                 try:
                     member = await guild.fetch_member(int(user_id))
