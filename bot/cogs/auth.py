@@ -4,6 +4,8 @@ import aiohttp
 import discord
 from discord.ext import commands, tasks
 from discord.ui import View
+from flask import Flask, request
+import threading
 
 from bot.config import CLIENT_ID, CLIENT_SECRET, REDIRECT_URI
 
@@ -42,22 +44,44 @@ def make_oauth_url(user_id: int):
     )
 
 # ===============================
-# Cog
+# Flaskサーバー（OAuthコード受け取り用）
+# ===============================
+app = Flask("auth_server")
+
+@app.route("/oauth/callback")
+def oauth_callback():
+    code = request.args.get("code")
+    state = request.args.get("state")  # user_id
+    if not code or not state:
+        return "無効なリクエスト", 400
+
+    auth_codes[state] = code
+    save("auth_codes", auth_codes)
+
+    return "認証コードを受け取りました。Botでの処理をお待ちください。"
+
+def run_flask():
+    app.run(host="0.0.0.0", port=5000)
+
+threading.Thread(target=run_flask, daemon=True).start()
+
+# ===============================
+# Discord Cog
 # ===============================
 class AuthCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+        self.session = aiohttp.ClientSession()
         self.auth_loop.start()
 
     # ---------------------------
-    # /auth
+    # /auth コマンド
     # ---------------------------
     @discord.app_commands.command(name="auth", description="認証を開始します")
     async def auth(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
 
         url = make_oauth_url(interaction.user.id)
-
         view = View(timeout=300)
         view.add_item(
             discord.ui.Button(
@@ -84,18 +108,17 @@ class AuthCog(commands.Cog):
                 continue
 
             # token取得
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    "https://discord.com/api/oauth2/token",
-                    data={
-                        "client_id": CLIENT_ID,
-                        "client_secret": CLIENT_SECRET,
-                        "grant_type": "authorization_code",
-                        "code": code,
-                        "redirect_uri": REDIRECT_URI,
-                    }
-                ) as resp:
-                    token = await resp.json()
+            async with self.session.post(
+                "https://discord.com/api/oauth2/token",
+                data={
+                    "client_id": CLIENT_ID,
+                    "client_secret": CLIENT_SECRET,
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "redirect_uri": REDIRECT_URI,
+                }
+            ) as resp:
+                token = await resp.json()
 
             if "access_token" not in token:
                 del auth_codes[user_id]
@@ -105,36 +128,55 @@ class AuthCog(commands.Cog):
             access_token = token["access_token"]
 
             # guilds取得
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    "https://discord.com/api/users/@me/guilds",
-                    headers={"Authorization": f"Bearer {access_token}"}
-                ) as resp:
-                    guilds = await resp.json()
+            async with self.session.get(
+                "https://discord.com/api/users/@me/guilds",
+                headers={"Authorization": f"Bearer {access_token}"}
+            ) as resp:
+                guilds = await resp.json()
 
             user_guilds = {g["id"] for g in guilds}
 
             # 禁止サーバーチェック
             if any(b in user_guilds for b in banned_guilds):
-                await user.send("❌ 禁止サーバーに参加しているため認証できません")
+                try:
+                    await user.send("❌ 禁止サーバーに参加しているため認証できません")
+                except discord.Forbidden:
+                    pass
                 del auth_codes[user_id]
                 save("auth_codes", auth_codes)
                 continue
 
             # ロール付与
             for guild in self.bot.guilds:
-                member = guild.get_member(int(user_id))
-                if not member:
+                try:
+                    member = await guild.fetch_member(int(user_id))
+                except discord.NotFound:
                     continue
 
                 role_id = auth_data.get(str(guild.id))
-                role = guild.get_role(role_id) if role_id else None
-                if role:
-                    await member.add_roles(role)
+                if not role_id:
+                    continue
 
-            await user.send("✅ 認証が完了しました！")
+                role = guild.get_role(role_id)
+                if role:
+                    try:
+                        await member.add_roles(role)
+                    except discord.Forbidden:
+                        print(f"権限不足: {guild.name} の {role.name}")
+                    except discord.HTTPException as e:
+                        print(f"ロール付与失敗: {e}")
+
+            try:
+                await user.send("✅ 認証が完了しました！")
+            except discord.Forbidden:
+                pass
+
             del auth_codes[user_id]
             save("auth_codes", auth_codes)
+
+    @auth_loop.before_loop
+    async def before_auth_loop(self):
+        await self.bot.wait_until_ready()
 
     # ---------------------------
     # 管理コマンド
@@ -153,6 +195,9 @@ class AuthCog(commands.Cog):
             banned_guilds.append(guild_id)
             save("banned_guilds", banned_guilds)
         await interaction.response.send_message("✅ 禁止サーバーを追加しました", ephemeral=True)
+
+    def cog_unload(self):
+        self.bot.loop.create_task(self.session.close())
 
 # ===============================
 # setup
