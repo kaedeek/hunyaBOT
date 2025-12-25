@@ -46,7 +46,7 @@ def run_flask():
 # ===============================
 # Discord Bot
 # ===============================
-bot = commands.Bot(command_prefix="!")
+bot = commands.Bot(command_prefix="!", intents=intents)
 
 threading.Thread(target=run_flask, daemon=True).start()
 
