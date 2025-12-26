@@ -1,20 +1,37 @@
-import threading
 import os
+import threading
+import asyncio
+import json
 import discord
 from discord.ext import commands
 from flask import Flask, request
 
 from bot.config import BOT_TOKEN
-from bot.cogs.auth import AuthCog
 
-# ===============================
-# Flask（OAuth callback用）
-# ===============================
 app = Flask(__name__)
+DATA_DIR = "data"
+AUTH_CODES = os.path.join(DATA_DIR, "auth_codes.json")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+
+def load_codes():
+    if os.path.exists(AUTH_CODES):
+        with open(AUTH_CODES, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def save_codes(data):
+    with open(AUTH_CODES, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+auth_codes = load_codes()
 
 @app.route("/")
 def home():
-    return "Bot is running"
+    return "OK"
+
 
 @app.route("/callback")
 def callback():
@@ -22,60 +39,38 @@ def callback():
     state = request.args.get("state")
 
     if not code or not state:
-        return "❌ 認証に失敗しました"
+        return "❌ 認証失敗"
 
-    try:
-        user_id, guild_id = map(int, state.split(":"))
-    except ValueError:
-        return "❌ state が不正です"
+    user_id, guild_id = map(int, state.split(":"))
+    auth_codes[state] = code
+    save_codes(auth_codes)
 
-    auth_cog = bot.get_cog("AuthCog")
-    if auth_cog:
-        # Flask → Discord（非同期）へ処理を渡す
-        bot.loop.create_task(
-            auth_cog.handle_oauth(code, user_id, guild_id)
-        )
+    cog = bot.get_cog("AuthCog")
+    asyncio.run_coroutine_threadsafe(
+        cog.handle_oauth(code, user_id, guild_id),
+        bot.loop
+    )
 
-    return "✅ 認証完了しました。Discordに戻ってください。"
+    return "✅ 認証完了"
+
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
-    app.run(
-        host="0.0.0.0",
-        port=port,
-        debug=False,
-        use_reloader=False
-    )
+    app.run(host="0.0.0.0", port=port, use_reloader=False)
 
-# ===============================
-# Discord Bot
-# ===============================
+
 intents = discord.Intents.default()
 intents.members = True
 
-bot = commands.Bot(
-    command_prefix="!",
-    intents=intents
-)
-
-# Flaskを別スレッドで起動
-threading.Thread(target=run_flask, daemon=True).start()
+bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
 async def on_ready():
-    print(f"✅ Logged in as {bot.user}")
-
-    # Cog登録（引数は bot だけ）
-    await bot.add_cog(AuthCog(bot))
-
+    print(f"Logged in as {bot.user}")
+    await bot.load_extension("bot.cogs.auth")
     await bot.tree.sync()
-    print("✅ Commands synced")
+    print("Commands synced")
 
-# ===============================
-# 起動
-# ===============================
-if __name__ == "__main__":
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN が設定されていません")
+threading.Thread(target=run_flask, daemon=True).start()
 
-    bot.run(BOT_TOKEN)
+bot.run(BOT_TOKEN)
