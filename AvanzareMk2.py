@@ -4,7 +4,7 @@ import discord
 from discord.ext import commands
 from bot.cogs import auth  # bot/cogs/auth.py の AuthCog
 from bot.config import BOT_TOKEN
-
+import threading
 # ===============================
 # Bot 作成
 # ===============================
